@@ -12,6 +12,7 @@ use std::os::fd::AsRawFd;
 use std::os::windows::fs::OpenOptionsExt as WinOpenOptionsExt;
 use sysinfo::Disks;
 use chrono::Local;
+use aligned_vec::{AVec, ConstAlign};
 
 #[cfg(target_os = "macos")]
 static MAC_MEDIA_DIRS: Lazy<Vec<&'static str>> = Lazy::new(|| vec!["/Volumes"]);
@@ -106,7 +107,7 @@ fn open_write(path: &std::path::Path, direct: bool) -> std::io::Result<File> {
         use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_WRITE_THROUGH};
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true);
-        if direct { opts.custom_flags(FILE_FLAG_WRITE_THROUGH as u32); } // Fix type
+        if direct { opts.custom_flags(FILE_FLAG_WRITE_THROUGH as u32); }
         let f = opts.open(path)?;
         Ok(f)
     }
@@ -115,7 +116,7 @@ fn open_write(path: &std::path::Path, direct: bool) -> std::io::Result<File> {
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true);
         if direct {
-            opts.custom_flags(libc::O_SYNC);
+            opts.custom_flags(libc::O_SYNC | libc::O_DIRECT);  // O_DIRECT + O_SYNC
         }
         let f = opts.open(path)?;
         #[cfg(target_os = "macos")]
@@ -127,10 +128,10 @@ fn open_write(path: &std::path::Path, direct: bool) -> std::io::Result<File> {
 fn open_read(path: &std::path::Path, direct: bool) -> std::io::Result<File> {
     #[cfg(target_os = "windows")]
     {
-        use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_WRITE_THROUGH};
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
-        if direct { opts.custom_flags(FILE_FLAG_WRITE_THROUGH as u32); } // Fix type
+        if direct { opts.custom_flags(FILE_FLAG_NO_BUFFERING as u32); }
         let f = opts.open(path)?;
         Ok(f)
     }
@@ -138,7 +139,9 @@ fn open_read(path: &std::path::Path, direct: bool) -> std::io::Result<File> {
     {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
-        if direct { opts.custom_flags(libc::O_SYNC); }
+        if direct {
+            opts.custom_flags(libc::O_DIRECT);
+        }
         let f = opts.open(path)?;
         #[cfg(target_os = "macos")]
         if direct { set_nocache(&f); }
@@ -215,6 +218,7 @@ fn main() -> std::io::Result<()> {
     let total = parse_size(&args.size);
     let block = parse_size(&args.block);
     assert!(block > 0 && total >= block, "block must be >0 and <= total size");
+    assert!(block % 512 == 0, "block size must be multiple of 512 bytes for direct I/O");
 
     let target_dir = match args.target_dir {
         Some(p) => p,
@@ -230,7 +234,8 @@ fn main() -> std::io::Result<()> {
 
     // precreate a block of pseudo-random bytes
     let mut rng = SmallRng::seed_from_u64(0x5EED_CAFE);
-    let mut buf = vec![0u8; block as usize];
+    let mut buf = AVec::<u8, ConstAlign<512>>::with_capacity(512, block as usize);
+    buf.resize(block as usize, 0u8);
     rng.fill_bytes(&mut buf);
 
     let mut written: u64 = 0;
@@ -249,7 +254,8 @@ fn main() -> std::io::Result<()> {
     // -------- READ --------
     let f = open_read(&test_path, true)?;
     let mut reader = BufReader::with_capacity(block as usize, f);
-    let mut read_buf = vec![0u8; block as usize];
+    let mut read_buf = AVec::<u8, ConstAlign<512>>::with_capacity(512, block as usize);
+    read_buf.resize(block as usize, 0u8);
     let mut read_total: u64 = 0;
     let t1 = Instant::now();
     loop {
